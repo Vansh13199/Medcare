@@ -1,0 +1,96 @@
+import { Routes, Route } from 'react-router-dom';
+import { SignedIn, SignedOut, RedirectToSignIn, SignIn } from "@clerk/clerk-react";
+
+// --- Import All Your Pages ---
+import DashboardPage from './pages/DashboardPage';
+import PatientListPage from './pages/PatientListPage';
+import PatientDetailPage from './pages/PatientDetailPage';
+import PatientFormPage from './pages/PatientFormPage';
+import NewPrescriptionPage from './pages/NewPrescriptionPage'; 
+// We'll use this as a placeholder for the /reports route
+import ReportsPage from './pages/ReportsPage'; 
+
+function App() {
+
+  return (
+    <Routes>
+      {/* --- Public Sign-In Route --- */}
+      {/* This is the only page a signed-out user can see */}
+      <Route 
+        path="/sign-in" 
+        element={<SignIn routing="path" path="/sign-in" />} 
+      />
+      
+      {/* --- Protected Routes --- */}
+      {/* All routes inside <SignedIn> are protected. */}
+      {/* If a user is not logged in, they will be redirected to /sign-in */}
+      
+      <Route 
+        path="/" 
+        element={
+          <SignedIn>
+            <DashboardPage />
+          </SignedIn>
+        } 
+      />
+      
+      <Route 
+        path="/patients" 
+        element={
+          <SignedIn>
+            <PatientListPage /> 
+          </SignedIn>
+        } 
+      />
+      
+      <Route 
+        path="/patients/:id" 
+        element={
+          <SignedIn>
+            <PatientDetailPage />
+          </SignedIn>
+        } 
+      />
+
+      <Route 
+        path="/patients/new" 
+        element={
+          <SignedIn>
+            <PatientFormPage />
+          </SignedIn>
+        } 
+      />
+
+      <Route 
+        path="/patients/:id/new-prescription" 
+        element={
+          <SignedIn>
+            <NewPrescriptionPage />
+          </SignedIn>
+        } 
+      />
+      
+      <Route 
+        path="/reports" 
+        element={
+          <SignedIn>
+            <ReportsPage />
+          </SignedIn>
+        } 
+      />
+      
+      {/* --- Catch-all for unauthenticated users --- */}
+      {/* Any other path will redirect to sign-in if the user is logged out */}
+      <Route 
+        path="*"
+        element={
+          <SignedOut>
+            <RedirectToSignIn redirectUrl="/sign-in" />
+          </SignedOut>
+        }
+      />
+    </Routes>
+  );
+}
+
+export default App;

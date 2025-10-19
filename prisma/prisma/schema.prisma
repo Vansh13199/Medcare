@@ -1,0 +1,83 @@
+// This is your Prisma schema file.
+// Learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL") // This loads from your .env file
+}
+
+// ---------------------------------------------
+// Model for Patient Records (Step 2)
+// ---------------------------------------------
+model Patient {
+  id               String   @id @default(cuid())
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  // Personal Info (from your form)
+  fullName         String
+  dob              DateTime // Date of Birth
+  gender           String
+  bloodType        String?  // Marked as optional
+  contactNumber    String?
+  emergencyContact String?
+
+  // Medical Info (from your form) - CRITICAL for analysis
+  allergies        String? // Stored as a simple text block
+  medicalHistory   String? // Stored as a simple text block
+
+  // --- Relationships ---
+  // A Patient can have many Prescriptions
+  prescriptions Prescription[]
+}
+
+// ---------------------------------------------
+// Model for a Single Prescription Event (Steps 3-7)
+// ---------------------------------------------
+model Prescription {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // This is the doctor's ID from Clerk
+  doctorId    String  
+
+  // --- AI Analysis Results (from Steps 4, 5, 6) ---
+  riskLevel       String? // e.g., "Low", "Moderate", "High"
+  summary         String? // The text summary from the AI
+  recommendations String[] // A list of recommendations
+
+  // --- Relationships ---
+  // A Prescription belongs to one Patient
+  patientId   String
+  patient     Patient  @relation(fields: [patientId], references: [id])
+  
+  // A Prescription has many individual drug lines
+  prescribedDrugs PrescribedDrug[]
+
+  @@index([patientId])
+  @@index([doctorId])
+}
+
+// ---------------------------------------------
+// Model for a "line item" on a Prescription
+// ---------------------------------------------
+model PrescribedDrug {
+  id        String   @id @default(cuid())
+  
+  // Drug info (from your form)
+  name      String   // e.g., "Lisinopril"
+  dosage    String   // e.g., "10mg"
+  frequency String   // e.g., "Daily"
+
+  // --- Relationships ---
+  // This drug line belongs to one Prescription
+  prescriptionId String
+  prescription   Prescription @relation(fields: [prescriptionId], references: [id])
+
+  @@index([prescriptionId])
+}
