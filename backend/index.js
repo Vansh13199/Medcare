@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import sql from 'mssql'; // Use the mssql library
+import sql from 'mssql'; 
 import { fileURLToPath } from 'url';
 import path from 'path';
 import multer from 'multer';
