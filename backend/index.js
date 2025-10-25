@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import sql from 'mssql'; 
+import sql from 'mssql'; // Use the mssql library
 import { fileURLToPath } from 'url';
 import path from 'path';
 import multer from 'multer';
@@ -17,10 +17,10 @@ const upload = multer({ storage: storage });
 
 // --- SQL Server Database Connection Config ---
 const sqlConfig = {
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    server: process.env.DB_SERVER,
-    database: process.env.DB_DATABASE,
+    server: 'medcure.database.windows.net', // your server name or IP
+    user: 'vansh1319', // your SQL username
+    password: 'Vansh@20', // your SQL password
+    database: 'Medcure', // your DB name
     options: {
         encrypt: true,
         trustServerCertificate: false
