@@ -1,287 +1,300 @@
-import 'dotenv/config';
+import 'dotenv/config'; 
 import express from 'express';
 import cors from 'cors';
-import sqlite3 from 'sqlite3';
+import sql from 'mssql'; 
 import { fileURLToPath } from 'url';
 import path from 'path';
-import multer from 'multer'; // For handling image uploads
-import axios from 'axios';   // For making API calls to AI services
+import multer from 'multer';
+import axios from 'axios';
 
 // --- Basic Setup ---
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3001; // Read port from environment
+
+// --- Credentials read from environment variables ---
+const DB_USER = process.env.DB_USER;
+const DB_PASSWORD = process.env.DB_PASSWORD;
+const DB_SERVER = process.env.DB_SERVER;
+const DB_DATABASE = process.env.DB_DATABASE;
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY; // Read from env
+const GOOGLE_GEMINI_API_KEY = process.env.GOOGLE_GEMINI_API_KEY; // Read from env
+const FRONTEND_URL = process.env.FRONTEND_URL; // Read from env
 
 // --- Multer Setup ---
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// --- Database Connection ---
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const dbPath = path.join(__dirname, process.env.DATABASE_URL);
-
-console.log(`[DEBUG] Attempting to connect to database at: ${dbPath}`);
-
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) {
-        console.error("Fatal Error: Could not connect to the database.", err.message);
-        process.exit(1);
-    } else {
-        console.log(`Successfully connected to the SQLite database.`);
+// --- SQL Server Database Connection Config (Uses variables from env) ---
+const sqlConfig = {
+    user: DB_USER,
+    password: DB_PASSWORD,
+    server: DB_SERVER,
+    database: DB_DATABASE,
+    options: {
+        encrypt: true,
+        trustServerCertificate: false
+    },
+    pool: {
+        max: 10,
+        min: 0,
+        idleTimeoutMillis: 30000
     }
-});
+};
 
-// --- Create/Update Tables on Startup ---
-const tableCreationSql = `
-  CREATE TABLE IF NOT EXISTS Patient (
-    id TEXT PRIMARY KEY, createdAt TEXT, updatedAt TEXT, fullName TEXT, dob TEXT, gender TEXT, bloodType TEXT,
-    contactNumber TEXT, emergencyContact TEXT, allergies TEXT, medicalHistory TEXT
-  );
-  CREATE TABLE IF NOT EXISTS Prescription (
-    id TEXT PRIMARY KEY, patientId TEXT NOT NULL, doctorId TEXT, riskLevel TEXT, summary TEXT, recommendations TEXT, createdAt TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (patientId) REFERENCES Patient (id) ON DELETE CASCADE -- Added CASCADE delete
-  );
-  CREATE TABLE IF NOT EXISTS PrescribedDrug (
-    id TEXT PRIMARY KEY, prescriptionId TEXT NOT NULL, name TEXT NOT NULL, dosage TEXT, frequency TEXT,
-    FOREIGN KEY (prescriptionId) REFERENCES Prescription (id) ON DELETE CASCADE -- Added CASCADE delete
-  );
-`;
-db.exec(tableCreationSql, (err) => {
-    if (err) console.error("Error creating tables:", err.message);
-    else console.log("Database tables are ready.");
+// --- Global Connection Pool ---
+let pool;
+try {
+    if (!DB_USER || !DB_PASSWORD || !DB_SERVER || !DB_DATABASE) {
+        throw new Error('Missing required database environment variables (DB_USER, DB_PASSWORD, DB_SERVER, DB_DATABASE)');
+    }
+    pool = await sql.connect(sqlConfig);
+    console.log('Successfully connected global pool to SQL Server database.');
+} catch (err) {
+    console.error("Fatal Error: Could not connect global pool to SQL Server.", err.stack);
+    process.exit(1);
+}
+
+// --- Function to Create Tables ---
+async function setupDatabase() {
+    const createPatientTable = `
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Patient]') AND type in (N'U'))
+        CREATE TABLE [dbo].[Patient] ( [id] NVARCHAR(255) PRIMARY KEY, [createdAt] DATETIMEOFFSET DEFAULT SYSUTCDATETIME(), [updatedAt] DATETIMEOFFSET DEFAULT SYSUTCDATETIME(), [fullName] NVARCHAR(255), [dob] NVARCHAR(50), [gender] NVARCHAR(50), [bloodType] NVARCHAR(10), [contactNumber] NVARCHAR(50), [emergencyContact] NVARCHAR(50), [allergies] NVARCHAR(MAX), [medicalHistory] NVARCHAR(MAX) );
+    `;
+    const createPrescriptionTable = `
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Prescription]') AND type in (N'U'))
+        CREATE TABLE [dbo].[Prescription] ( [id] NVARCHAR(255) PRIMARY KEY, [patientId] NVARCHAR(255) NOT NULL, [doctorId] NVARCHAR(255), [riskLevel] NVARCHAR(50), [summary] NVARCHAR(MAX), [recommendations] NVARCHAR(MAX), [createdAt] DATETIMEOFFSET DEFAULT SYSUTCDATETIME(), CONSTRAINT FK_Prescription_Patient FOREIGN KEY ([patientId]) REFERENCES [dbo].[Patient]([id]) ON DELETE CASCADE );
+    `;
+    const createPrescribedDrugTable = `
+        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[PrescribedDrug]') AND type in (N'U'))
+        CREATE TABLE [dbo].[PrescribedDrug] ( [id] NVARCHAR(255) PRIMARY KEY, [prescriptionId] NVARCHAR(255) NOT NULL, [name] NVARCHAR(255) NOT NULL, [dosage] NVARCHAR(100), [frequency] NVARCHAR(100), CONSTRAINT FK_PrescribedDrug_Prescription FOREIGN KEY ([prescriptionId]) REFERENCES [dbo].[Prescription]([id]) ON DELETE CASCADE );
+    `;
+    try {
+        console.log('Checking/Creating database tables...');
+        await pool.request().query(createPatientTable);
+        await pool.request().query(createPrescriptionTable);
+        await pool.request().query(createPrescribedDrugTable);
+        console.log('Database tables are ready.');
+    } catch (err) {
+        console.error("Fatal Error during database table setup:", err.stack);
+        process.exit(1);
+    }
+}
+
+// --- Run Database Setup ---
+setupDatabase().catch(err => {
+    console.error("Database setup failed, server not started:", err);
+    process.exit(1);
 });
 
 // --- Middleware ---
-app.use(cors({ origin: process.env.FRONTEND_URL }));
+app.use(cors({ origin: FRONTEND_URL }));
 app.use(express.json());
 
-
-// --- AI Helper Function for Gemini Vision ---
+// --- AI Helper ---
 async function analyzeImageWithGemini(prompt, imageBase64, imageMediaType) {
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${process.env.GOOGLE_GEMINI_API_KEY}`;
-    
+    if (!GOOGLE_GEMINI_API_KEY) {
+        console.error('[AI] Error: GOOGLE_GEMINI_API_KEY environment variable is not set.');
+        throw new Error('AI service configuration error.');
+    }
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${GOOGLE_GEMINI_API_KEY}`;
     const requestBody = {
         contents: [ { parts: [ { text: prompt }, { inline_data: { mime_type: imageMediaType, data: imageBase64 } } ] } ],
         generationConfig: { responseMimeType: "application/json" }
     };
-
     try {
         console.log('[AI] Sending image and prompt to Google Gemini Vision...');
         const response = await axios.post(geminiUrl, requestBody);
         
-        // Error handling for Gemini response structure
-        if (!response.data || !response.data.candidates || !response.data.candidates[0] || !response.data.candidates[0].content || !response.data.candidates[0].content.parts || !response.data.candidates[0].content.parts[0] || !response.data.candidates[0].content.parts[0].text) {
+        if (!response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
              console.error('[AI] Gemini response format unexpected:', JSON.stringify(response.data, null, 2));
              throw new Error('Gemini response format was unexpected.');
         }
         
         const resultJsonString = response.data.candidates[0].content.parts[0].text;
-        const resultJson = JSON.parse(resultJsonString);
-        console.log('[AI] Gemini analysis successful.');
-        return resultJson;
+        // --- ⭐️ Log the raw string ---
+        console.log('[AI] Raw JSON String received from Gemini:', resultJsonString); 
+        
+        // Attempt to parse
+        let resultJson;
+        try {
+            resultJson = JSON.parse(resultJsonString);
+        } catch (parseError) {
+             console.error('[AI] Failed to parse JSON string from Gemini:', parseError);
+             console.error('[AI] Raw string was:', resultJsonString);
+             throw new Error('AI returned invalid JSON.');
+        }
+        console.log('[AI] Gemini analysis successful (JSON parsed).');
+        return resultJson; // Return the parsed object
     } catch (error) {
-        console.error('[AI] Gemini Vision API call failed.', error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
-        // More specific error based on Google API response
-        if (error.response && error.response.data && error.response.data.error) {
+        console.error('[AI] Gemini Vision API call or processing failed.', error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
+        if (error.response?.data?.error) {
              throw new Error(`Gemini API Error: ${error.response.data.error.message}`);
         }
-        throw new Error('Failed to analyze the image with Gemini.');
+        // Re-throw original error or a more generic one if it wasn't an API error
+        throw error instanceof Error ? error : new Error('Failed to analyze the image with Gemini.');
     }
 }
 
-
 // --- API Routes ---
+app.get('/api/test', (req, res) => {
+    res.status(200).json({ message: "Backend API is running successfully!" });
+});
 
-/**
- * @route   GET /api/stats
- * @desc    Get dashboard statistics
- */
-app.get('/api/stats', (req, res) => {
-    const stats = {};
-    const queries = [
-        { sql: "SELECT COUNT(*) as totalPatients FROM Patient;", key: 'totalPatients' },
-        { sql: "SELECT COUNT(*) as prescriptionsToday FROM Prescription WHERE createdAt >= datetime('now', '-1 day');", key: 'prescriptionsToday' },
-        { sql: "SELECT COUNT(*) as highRiskAlerts FROM Prescription WHERE riskLevel = 'High';", key: 'highRiskAlerts' }
-    ];
-    let completed = 0;
-    let errors = false; // Flag to prevent multiple error responses
-
-    queries.forEach(queryInfo => {
-        db.get(queryInfo.sql, [], (err, row) => {
-            if (errors) return; // Stop if an error already occurred
-            if (err) {
-                errors = true;
-                console.error('Error fetching stats:', err.message);
-                if (!res.headersSent) {
-                    res.status(500).json({ error: 'Failed to retrieve dashboard stats.' });
-                }
-                return;
-            }
-            stats[queryInfo.key] = Object.values(row)[0];
-            completed++;
-
-            if (completed === queries.length) {
-                 if (!res.headersSent) {
-                     res.status(200).json(stats);
-                 }
-            }
+app.get('/api/stats', async (req, res) => {
+    try {
+        const request = pool.request();
+        const patientsResult = await request.query('SELECT COUNT(*) as count FROM Patient');
+        const prescriptionsResult = await request.query("SELECT COUNT(*) as count FROM Prescription WHERE createdAt >= DATEADD(day, -1, SYSUTCDATETIME())");
+        const alertsResult = await request.query("SELECT COUNT(*) as count FROM Prescription WHERE riskLevel = 'High'");
+        res.status(200).json({
+            totalPatients: patientsResult.recordset[0].count,
+            prescriptionsToday: prescriptionsResult.recordset[0].count,
+            highRiskAlerts: alertsResult.recordset[0].count
         });
-    });
+    } catch (err) {
+        console.error('Error fetching stats:', err.message);
+        res.status(500).json({ error: 'Failed to retrieve stats.' });
+    }
 });
 
-/**
- * @route   POST /api/prescriptions/upload/:patientId
- * @desc    Upload prescription image, analyze with AI, and save to DB
- */
-app.post('/api/prescriptions/upload/:patientId', upload.single('prescriptionImage'), (req, res) => {
+app.post('/api/prescriptions/upload/:patientId', upload.single('prescriptionImage'), async (req, res) => {
     const { patientId } = req.params;
-    
-    if (!req.file) {
-        return res.status(400).json({ error: 'No prescription image was uploaded.' });
+    if (!req.file) return res.status(400).json({ error: 'No prescription image uploaded.' });
+
+    const transaction = new sql.Transaction(pool);
+    try {
+        await transaction.begin();
+        const request = new sql.Request(transaction);
+
+        const patientCheck = await request.input('patientId', sql.NVarChar, patientId).query('SELECT id FROM Patient WHERE id = @patientId');
+        if (patientCheck.recordset.length === 0) {
+            await transaction.rollback();
+            return res.status(404).json({ error: `Patient not found.` });
+        }
+
+        const imageBase64 = req.file.buffer.toString('base64');
+        const imageMediaType = req.file.mimetype;
+        const prompt = `
+            You are a highly accurate medical transcription... (full prompt here, including JSON structure and disclaimer)
+            { 
+              "riskLevel": "...", 
+              "summary": "...", 
+              "recommendations": ["..."], 
+              "extractedDrugs": [{ "name": "...", "dosage": "...", "frequency": "..." }], 
+              "alternativePrescription": { ... },
+              "disclaimer": "..."
+            }
+        `;
+        const analysisResult = await analyzeImageWithGemini(prompt, imageBase64, imageMediaType);
+        console.log('[AI] Parsed analysis:', analysisResult);
+
+        // --- ⭐️ More Specific Validation ---
+        let validationError = null;
+        if (!analysisResult || typeof analysisResult !== 'object') {
+            validationError = 'AI response is not a valid object.';
+        } else if (!analysisResult.riskLevel) {
+            validationError = 'AI response is missing the "riskLevel" field.';
+        } else if (!Array.isArray(analysisResult.extractedDrugs)) {
+            validationError = 'AI response is missing the "extractedDrugs" array.';
+        } // Add more checks if needed (e.g., for disclaimer)
+
+        if (validationError) {
+             console.error(`[AI Validation Error] ${validationError}`, analysisResult);
+             throw new Error(`AI response structure was invalid: ${validationError}`);
+        }
+        // --- End Validation ---
+
+        const newPrescriptionId = `pres_${Date.now()}`;
+        const doctorId = 'doc_placeholder_123';
+
+        const prescriptionRequest = new sql.Request(transaction);
+        await prescriptionRequest
+            .input('id', sql.NVarChar, newPrescriptionId)
+            .input('patientId', sql.NVarChar, patientId)
+            .input('doctorId', sql.NVarChar, doctorId)
+            .input('riskLevel', sql.NVarChar, analysisResult.riskLevel)
+            .input('summary', sql.NVarChar, analysisResult.summary || '')
+            .input('recommendations', sql.NVarChar, JSON.stringify(analysisResult.recommendations || []))
+            .query(`INSERT INTO Prescription (id, patientId, doctorId, riskLevel, summary, recommendations, createdAt) VALUES (@id, @patientId, @doctorId, @riskLevel, @summary, @recommendations, SYSUTCDATETIME())`);
+
+        if (analysisResult.extractedDrugs.length > 0) {
+            for (const drug of analysisResult.extractedDrugs) {
+                const drugRequest = new sql.Request(transaction);
+                const newDrugId = `drug_${Date.now()}_${Math.random()}`;
+                await drugRequest
+                    .input('id', sql.NVarChar, newDrugId)
+                    .input('prescriptionId', sql.NVarChar, newPrescriptionId)
+                    .input('name', sql.NVarChar, drug.name || 'Unknown')
+                    .input('dosage', sql.NVarChar, drug.dosage || 'N/A')
+                    .input('frequency', sql.NVarChar, drug.frequency || 'N/A')
+                    .query(`INSERT INTO PrescribedDrug (id, prescriptionId, name, dosage, frequency) VALUES (@id, @prescriptionId, @name, @dosage, @frequency)`);
+            }
+        }
+        await transaction.commit();
+        res.status(201).json({ id: newPrescriptionId, patientId, ...analysisResult });
+
+    } catch (error) {
+        console.error('Error in prescription upload:', error.message);
+        try { if (transaction && transaction.active) await transaction.rollback(); }
+        catch (rollbackError) { console.error('Failed to rollback transaction:', rollbackError); }
+        // Send back the specific error message
+        res.status(500).json({ error: error.message || 'An error occurred during prescription processing.' });
     }
-
-    const patientCheckSql = "SELECT id FROM Patient WHERE id = ?";
-    db.get(patientCheckSql, [patientId], async (err, patientRow) => {
-        if (err) {
-            console.error('[DB CHECK ERROR]', err.message);
-            return res.status(500).json({ error: 'Database error while verifying patient.' });
-        }
-        if (!patientRow) {
-            return res.status(404).json({ error: `Patient with ID ${patientId} not found.` });
-        }
-
-        try {
-            const imageBase64 = req.file.buffer.toString('base64');
-            const imageMediaType = req.file.mimetype;
-
-            const prompt = `
-                You are a highly accurate medical transcription and clinical analysis AI. Analyze the attached prescription image.
-                Your task is to:
-                1. Identify every drug listed. Handle common misspellings or blurry text.
-                2. Extract its dosage and frequency if available.
-                3. Analyze the combination of all drugs for potential interactions based on your internal medical knowledge.
-                4. Classify the overall interaction risk as "Low", "Moderate", or "High".
-                5. Provide a concise, clinician-focused summary of the most critical interaction.
-                6. List 2-3 actionable recommendations for the clinician regarding the CURRENT prescription.
-                7. IMPORTANT: If the riskLevel is 'Moderate' or 'High', suggest a safer, alternative prescription that treats the likely condition with fewer side effects.
-                8. Include a fixed disclaimer text in a 'disclaimer' field.
-                
-                Return ONLY a single, valid JSON object with the following structure. If no drugs are found, return an empty "extractedDrugs" array. If no alternative is needed, the "alternativePrescription" object can be null.
-                { 
-                  "riskLevel": "...", 
-                  "summary": "...", 
-                  "recommendations": ["...", "..."], 
-                  "extractedDrugs": [{ "name": "...", "dosage": "...", "frequency": "..." }], 
-                  "alternativePrescription": { "summary": "...", "drugs": [{ "name": "...", "dosage": "...", "frequency": "..." }] },
-                  "disclaimer": "This is an AI-generated analysis and has low credibility. It should not be used for final medical decisions without verification by a qualified healthcare professional."
-                }
-            `;
-
-            const analysisResult = await analyzeImageWithGemini(prompt, imageBase64, imageMediaType);
-            console.log('[AI] Received analysis:', analysisResult);
-            
-            // Validate essential fields from AI response
-            if (!analysisResult || typeof analysisResult !== 'object' || !analysisResult.riskLevel || !Array.isArray(analysisResult.extractedDrugs)) {
-                 console.error('[AI] Invalid response structure from Gemini:', analysisResult);
-                 throw new Error('AI response structure was invalid.');
-            }
-
-
-            const newPrescriptionId = `pres_${Date.now()}`;
-            const doctorId = 'doc_placeholder_123'; // TODO: Get this from Clerk auth
-
-            // Use promises for cleaner async database operations
-            const run = (sql, params = []) => new Promise((resolve, reject) => {
-                db.run(sql, params, function(err) {
-                    if (err) reject(err);
-                    else resolve(this); // 'this' contains lastID, changes
-                });
-            });
-
-            await run('BEGIN TRANSACTION;');
-            try {
-                const prescriptionSql = `INSERT INTO Prescription (id, patientId, doctorId, riskLevel, summary, recommendations, createdAt) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))`;
-                const prescriptionParams = [newPrescriptionId, patientId, doctorId, analysisResult.riskLevel, analysisResult.summary || '', JSON.stringify(analysisResult.recommendations || [])];
-                await run(prescriptionSql, prescriptionParams);
-
-                if (Array.isArray(analysisResult.extractedDrugs) && analysisResult.extractedDrugs.length > 0) {
-                    const drugSql = `INSERT INTO PrescribedDrug (id, prescriptionId, name, dosage, frequency) VALUES (?, ?, ?, ?, ?)`;
-                    for (const drug of analysisResult.extractedDrugs) {
-                        const newDrugId = `drug_${Date.now()}_${Math.random().toString(36).substring(2)}`; // More unique ID
-                        const drugParams = [newDrugId, newPrescriptionId, drug.name || 'Unknown', drug.dosage || 'N/A', drug.frequency || 'N/A'];
-                        await run(drugSql, drugParams);
-                    }
-                }
-
-                await run('COMMIT;');
-                const finalResult = { id: newPrescriptionId, patientId, ...analysisResult };
-                res.status(201).json(finalResult);
-
-            } catch (dbError) {
-                console.error('Database transaction error:', dbError.message);
-                await run('ROLLBACK;'); // Ensure rollback on error
-                res.status(500).json({ error: 'Failed to save prescription details to the database.' });
-            }
-
-        } catch (aiError) {
-            console.error('Error during AI analysis workflow:', aiError.message);
-            res.status(500).json({ error: aiError.message || 'An error occurred during the AI analysis workflow.' });
-        }
-    });
 });
 
-
-// --- GET Patient by ID ---
-app.get('/api/patients/:id', (req, res) => {
+// GET /api/patients/:id
+app.get('/api/patients/:id', async (req, res) => {
     const { id } = req.params;
-    db.get("SELECT * FROM Patient WHERE id = ?", [id], (err, row) => {
-        if (err) {
-            console.error('[DB GET /api/patients/:id] Error:', err.message);
-            return res.status(500).json({ error: 'Database error while fetching patient.' });
-        }
-        if (!row) {
-            return res.status(404).json({ error: 'Patient not found.' });
-        }
-        res.status(200).json(row);
-    });
-});
-
-// --- GET All Patients ---
-app.get('/api/patients', (req, res) => {
-    db.all("SELECT * FROM Patient ORDER BY createdAt DESC", [], (err, rows) => {
-        if (err) {
-            console.error('[DB GET /api/patients] Error:', err.message);
-            return res.status(500).json({ error: 'Failed to retrieve patients.' });
-        }
-        res.status(200).json(rows);
-    });
-});
-
-// --- POST New Patient ---
-app.post('/api/patients', (req, res) => {
-    const { fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory } = req.body;
-    
-    // Basic validation
-    if (!fullName || !dob) {
-        return res.status(400).json({ error: 'Full Name and Date of Birth are required.' });
+    try {
+        const request = pool.request();
+        const result = await request.input('id', sql.NVarChar, id).query('SELECT * FROM Patient WHERE id = @id');
+        if (result.recordset.length === 0) return res.status(404).json({ error: 'Patient not found.' });
+        res.status(200).json(result.recordset[0]);
+    } catch (err) {
+        res.status(500).json({ error: 'Database error.' });
     }
+});
+
+// GET /api/patients
+app.get('/api/patients', async (req, res) => {
+    try {
+        const request = pool.request();
+        const result = await request.query('SELECT * FROM Patient ORDER BY createdAt DESC');
+        res.status(200).json(result.recordset);
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to retrieve patients.' });
+    }
+});
+
+// POST /api/patients
+app.post('/api/patients', async (req, res) => {
+    const { fullName, dob } = req.body;
+    if (!fullName || !dob) return res.status(400).json({ error: 'Required fields missing.' });
     
     const newId = `pat_${Date.now()}`;
-    const sql = `INSERT INTO Patient (id, fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`;
-    const params = [newId, fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory];
-    
-    db.run(sql, params, function(err) {
-        if (err) {
-            console.error('[DB POST /api/patients] Error:', err.message);
-            return res.status(500).json({ error: 'Database error while creating patient.' });
-        }
+    try {
+        const request = pool.request();
+        await request
+            .input('id', sql.NVarChar, newId)
+            .input('fullName', sql.NVarChar, req.body.fullName)
+            .input('dob', sql.NVarChar, req.body.dob)
+            .input('gender', sql.NVarChar, req.body.gender)
+            .input('bloodType', sql.NVarChar, req.body.bloodType)
+            .input('contactNumber', sql.NVarChar, req.body.contactNumber)
+            .input('emergencyContact', sql.NVarChar, req.body.emergencyContact)
+            .input('allergies', sql.NVarChar, req.body.allergies)
+            .input('medicalHistory', sql.NVarChar, req.body.medicalHistory)
+            .query(`INSERT INTO Patient (id, fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory, createdAt, updatedAt) VALUES (@id, @fullName, @dob, @gender, @bloodType, @contactNumber, @emergencyContact, @allergies, @medicalHistory, SYSUTCDATETIME(), SYSUTCDATETIME())`);
         res.status(201).json({ id: newId, ...req.body });
-    });
+    } catch (err) {
+        console.error("DB Error creating patient:", err);
+        res.status(500).json({ error: 'Database error.' });
+    }
 });
 
-
-// --- Start the Server ---
+// --- Start Server ---
 app.listen(PORT, () => {
-    console.log(`Backend server is listening on http://localhost:${PORT}`);
+    console.log(`Backend server listening on http://localhost:${PORT}`);
     console.log("-------------------------------------------------");
 });
+

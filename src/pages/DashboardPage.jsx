@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { NavLink } from 'react-router-dom';
 import { useUser } from '@clerk/clerk-react';
 import Navbar from '../components/Navbar';
-import StatCard from '../components/StatCard';
+import StatCard from '../components/Statcard';
 import axios from 'axios';
 
 // --- Icons (unchanged) ---

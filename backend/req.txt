@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pyodbc
+aiohttp  # For async HTTP requests to Gemini
+python-multipart # For file uploads in FastAPI
