@@ -1,7 +1,7 @@
-import 'dotenv/config'; 
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import sql from 'mssql'; 
+import mysql from 'mysql2/promise'; // Use mysql2/promise
 import { fileURLToPath } from 'url';
 import path from 'path';
 import multer from 'multer';
@@ -9,70 +9,80 @@ import axios from 'axios';
 
 // --- Basic Setup ---
 const app = express();
-const PORT = process.env.PORT || 3001; // Read port from environment
-
-// --- Credentials read from environment variables ---
-const DB_USER = process.env.DB_USER;
-const DB_PASSWORD = process.env.DB_PASSWORD;
-const DB_SERVER = process.env.DB_SERVER;
-const DB_DATABASE = process.env.DB_DATABASE;
-const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY; // Read from env
-const GOOGLE_GEMINI_API_KEY = process.env.GOOGLE_GEMINI_API_KEY; // Read from env
-const FRONTEND_URL = process.env.FRONTEND_URL; // Read from env
+const PORT = process.env.PORT || 3001;
 
 // --- Multer Setup ---
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// --- SQL Server Database Connection Config (Uses variables from env) ---
-const sqlConfig = {
-    user: DB_USER,
-    password: DB_PASSWORD,
-    server: DB_SERVER,
-    database: DB_DATABASE,
-    options: {
-        encrypt: true,
-        trustServerCertificate: false
-    },
-    pool: {
-        max: 10,
-        min: 0,
-        idleTimeoutMillis: 30000
-    }
+// --- MySQL Database Connection Config ---
+const mysqlConfig = {
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_DATABASE,
+    port: process.env.DB_PORT || 3306,
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 };
 
 // --- Global Connection Pool ---
 let pool;
 try {
-    if (!DB_USER || !DB_PASSWORD || !DB_SERVER || !DB_DATABASE) {
-        throw new Error('Missing required database environment variables (DB_USER, DB_PASSWORD, DB_SERVER, DB_DATABASE)');
-    }
-    pool = await sql.connect(sqlConfig);
-    console.log('Successfully connected global pool to SQL Server database.');
+    pool = mysql.createPool(mysqlConfig);
+    console.log('Successfully created MySQL connection pool.');
 } catch (err) {
-    console.error("Fatal Error: Could not connect global pool to SQL Server.", err.stack);
+    console.error("Fatal Error: Could not create MySQL pool.", err.stack);
     process.exit(1);
 }
 
-// --- Function to Create Tables ---
+// --- Function to Create Tables (MySQL Syntax) ---
 async function setupDatabase() {
     const createPatientTable = `
-        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Patient]') AND type in (N'U'))
-        CREATE TABLE [dbo].[Patient] ( [id] NVARCHAR(255) PRIMARY KEY, [createdAt] DATETIMEOFFSET DEFAULT SYSUTCDATETIME(), [updatedAt] DATETIMEOFFSET DEFAULT SYSUTCDATETIME(), [fullName] NVARCHAR(255), [dob] NVARCHAR(50), [gender] NVARCHAR(50), [bloodType] NVARCHAR(10), [contactNumber] NVARCHAR(50), [emergencyContact] NVARCHAR(50), [allergies] NVARCHAR(MAX), [medicalHistory] NVARCHAR(MAX) );
+        CREATE TABLE IF NOT EXISTS Patient (
+            id VARCHAR(255) PRIMARY KEY,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            fullName VARCHAR(255),
+            dob VARCHAR(50),
+            gender VARCHAR(50),
+            bloodType VARCHAR(10),
+            contactNumber VARCHAR(50),
+            emergencyContact VARCHAR(50),
+            allergies TEXT,
+            medicalHistory TEXT
+        );
     `;
     const createPrescriptionTable = `
-        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[Prescription]') AND type in (N'U'))
-        CREATE TABLE [dbo].[Prescription] ( [id] NVARCHAR(255) PRIMARY KEY, [patientId] NVARCHAR(255) NOT NULL, [doctorId] NVARCHAR(255), [riskLevel] NVARCHAR(50), [summary] NVARCHAR(MAX), [recommendations] NVARCHAR(MAX), [createdAt] DATETIMEOFFSET DEFAULT SYSUTCDATETIME(), CONSTRAINT FK_Prescription_Patient FOREIGN KEY ([patientId]) REFERENCES [dbo].[Patient]([id]) ON DELETE CASCADE );
+        CREATE TABLE IF NOT EXISTS Prescription (
+            id VARCHAR(255) PRIMARY KEY,
+            patientId VARCHAR(255) NOT NULL,
+            doctorId VARCHAR(255),
+            riskLevel VARCHAR(50),
+            summary TEXT,
+            recommendations TEXT,
+            alternativePrescription TEXT, 
+            disclaimer TEXT,
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (patientId) REFERENCES Patient(id) ON DELETE CASCADE
+        );
     `;
     const createPrescribedDrugTable = `
-        IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[dbo].[PrescribedDrug]') AND type in (N'U'))
-        CREATE TABLE [dbo].[PrescribedDrug] ( [id] NVARCHAR(255) PRIMARY KEY, [prescriptionId] NVARCHAR(255) NOT NULL, [name] NVARCHAR(255) NOT NULL, [dosage] NVARCHAR(100), [frequency] NVARCHAR(100), CONSTRAINT FK_PrescribedDrug_Prescription FOREIGN KEY ([prescriptionId]) REFERENCES [dbo].[Prescription]([id]) ON DELETE CASCADE );
+        CREATE TABLE IF NOT EXISTS PrescribedDrug (
+            id VARCHAR(255) PRIMARY KEY,
+            prescriptionId VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            dosage VARCHAR(100),
+            frequency VARCHAR(100),
+            FOREIGN KEY (prescriptionId) REFERENCES Prescription(id) ON DELETE CASCADE
+        );
     `;
     try {
         console.log('Checking/Creating database tables...');
-        await pool.request().query(createPatientTable);
-        await pool.request().query(createPrescriptionTable);
-        await pool.request().query(createPrescribedDrugTable);
+        await pool.query(createPatientTable);
+        await pool.query(createPrescriptionTable);
+        await pool.query(createPrescribedDrugTable);
         console.log('Database tables are ready.');
     } catch (err) {
         console.error("Fatal Error during database table setup:", err.stack);
@@ -87,22 +97,26 @@ setupDatabase().catch(err => {
 });
 
 // --- Middleware ---
-app.use(cors({ origin: FRONTEND_URL }));
+app.use(cors({ origin: process.env.FRONTEND_URL }));
 app.use(express.json());
 
-// --- AI Helper ---
+// --- AI Helper Function for Gemini Vision ---
 async function analyzeImageWithGemini(prompt, imageBase64, imageMediaType) {
-    if (!GOOGLE_GEMINI_API_KEY) {
+    if (!process.env.GOOGLE_GEMINI_API_KEY) {
         console.error('[AI] Error: GOOGLE_GEMINI_API_KEY environment variable is not set.');
         throw new Error('AI service configuration error.');
     }
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${GOOGLE_GEMINI_API_KEY}`;
+    
+    // Using gemini-2.5-pro model
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${process.env.GOOGLE_GEMINI_API_KEY}`;
+    
     const requestBody = {
         contents: [ { parts: [ { text: prompt }, { inline_data: { mime_type: imageMediaType, data: imageBase64 } } ] } ],
         generationConfig: { responseMimeType: "application/json" }
     };
+
     try {
-        console.log('[AI] Sending image and prompt to Google Gemini Vision...');
+        console.log('[AI] Sending image and prompt to Google Gemini 2.5 Pro...');
         const response = await axios.post(geminiUrl, requestBody);
         
         if (!response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
@@ -111,45 +125,32 @@ async function analyzeImageWithGemini(prompt, imageBase64, imageMediaType) {
         }
         
         const resultJsonString = response.data.candidates[0].content.parts[0].text;
-        // --- ⭐️ Log the raw string ---
-        console.log('[AI] Raw JSON String received from Gemini:', resultJsonString); 
-        
-        // Attempt to parse
-        let resultJson;
-        try {
-            resultJson = JSON.parse(resultJsonString);
-        } catch (parseError) {
-             console.error('[AI] Failed to parse JSON string from Gemini:', parseError);
-             console.error('[AI] Raw string was:', resultJsonString);
-             throw new Error('AI returned invalid JSON.');
-        }
         console.log('[AI] Gemini analysis successful (JSON parsed).');
-        return resultJson; // Return the parsed object
+        return JSON.parse(resultJsonString);
     } catch (error) {
         console.error('[AI] Gemini Vision API call or processing failed.', error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
         if (error.response?.data?.error) {
              throw new Error(`Gemini API Error: ${error.response.data.error.message}`);
         }
-        // Re-throw original error or a more generic one if it wasn't an API error
-        throw error instanceof Error ? error : new Error('Failed to analyze the image with Gemini.');
+        throw new Error('Failed to analyze the image with Gemini.');
     }
 }
 
-// --- API Routes ---
+// --- API Routes (Updated for 'mysql2' syntax) ---
 app.get('/api/test', (req, res) => {
     res.status(200).json({ message: "Backend API is running successfully!" });
 });
 
 app.get('/api/stats', async (req, res) => {
     try {
-        const request = pool.request();
-        const patientsResult = await request.query('SELECT COUNT(*) as count FROM Patient');
-        const prescriptionsResult = await request.query("SELECT COUNT(*) as count FROM Prescription WHERE createdAt >= DATEADD(day, -1, SYSUTCDATETIME())");
-        const alertsResult = await request.query("SELECT COUNT(*) as count FROM Prescription WHERE riskLevel = 'High'");
+        const [patientsRows] = await pool.query('SELECT COUNT(*) as count FROM Patient');
+        const [prescriptionsRows] = await pool.query("SELECT COUNT(*) as count FROM Prescription WHERE createdAt >= NOW() - INTERVAL 1 DAY");
+        const [alertsRows] = await pool.query("SELECT COUNT(*) as count FROM Prescription WHERE riskLevel = 'High'");
+
         res.status(200).json({
-            totalPatients: patientsResult.recordset[0].count,
-            prescriptionsToday: prescriptionsResult.recordset[0].count,
-            highRiskAlerts: alertsResult.recordset[0].count
+            totalPatients: patientsRows[0].count,
+            prescriptionsToday: prescriptionsRows[0].count,
+            highRiskAlerts: alertsRows[0].count
         });
     } catch (err) {
         console.error('Error fetching stats:', err.message);
@@ -161,136 +162,196 @@ app.post('/api/prescriptions/upload/:patientId', upload.single('prescriptionImag
     const { patientId } = req.params;
     if (!req.file) return res.status(400).json({ error: 'No prescription image uploaded.' });
 
-    const transaction = new sql.Transaction(pool);
+    let connection; 
     try {
-        await transaction.begin();
-        const request = new sql.Request(transaction);
+        connection = await pool.getConnection(); 
+        await connection.beginTransaction(); 
 
-        const patientCheck = await request.input('patientId', sql.NVarChar, patientId).query('SELECT id FROM Patient WHERE id = @patientId');
-        if (patientCheck.recordset.length === 0) {
-            await transaction.rollback();
+        const [patientRows] = await connection.query('SELECT id FROM Patient WHERE id = ?', [patientId]);
+        if (patientRows.length === 0) {
+            await connection.rollback();
             return res.status(404).json({ error: `Patient not found.` });
         }
 
         const imageBase64 = req.file.buffer.toString('base64');
         const imageMediaType = req.file.mimetype;
         const prompt = `
-            You are a highly accurate medical transcription... (full prompt here, including JSON structure and disclaimer)
+            You are a highly accurate medical transcription and clinical analysis AI. Analyze the attached prescription image.
+            
+            First, assess the readability of the handwriting.
+            - IF the handwriting is completely unreadable, illegible, or the image is too blurry to analyze,
+              return ONLY the following JSON object:
+              { "error": "UNREADABLE", "message": "The prescription is unreadable." }
+
+            - OTHERWISE, if the image is readable, perform the following tasks:
+            1. Identify every drug listed.
+            2. Extract its dosage and frequency.
+            3. Analyze the drug combination for interactions.
+            4. Classify the overall risk as "Low", "Moderate", or "High".
+            5. Provide a concise summary of the critical interaction.
+            6. List actionable recommendations for the clinician.
+            7. If risk is 'Moderate' or 'High', suggest a safer alternative prescription.
+            8. Include a fixed disclaimer.
+            
+            Return ONLY a single, valid JSON object with this structure:
             { 
               "riskLevel": "...", 
               "summary": "...", 
-              "recommendations": ["..."], 
+              "recommendations": ["...", "..."], 
               "extractedDrugs": [{ "name": "...", "dosage": "...", "frequency": "..." }], 
-              "alternativePrescription": { ... },
-              "disclaimer": "..."
+              "alternativePrescription": { "summary": "...", "drugs": [{ "name": "...", "dosage": "...", "frequency": "..." }] },
+              "disclaimer": "This is an AI-generated analysis and has low credibility. It should not be used for final medical decisions without verification by a qualified healthcare professional."
             }
         `;
         const analysisResult = await analyzeImageWithGemini(prompt, imageBase64, imageMediaType);
-        console.log('[AI] Parsed analysis:', analysisResult);
+        console.log('[AI] Received analysis:', analysisResult);
 
-        // --- ⭐️ More Specific Validation ---
-        let validationError = null;
-        if (!analysisResult || typeof analysisResult !== 'object') {
-            validationError = 'AI response is not a valid object.';
-        } else if (!analysisResult.riskLevel) {
-            validationError = 'AI response is missing the "riskLevel" field.';
-        } else if (!Array.isArray(analysisResult.extractedDrugs)) {
-            validationError = 'AI response is missing the "extractedDrugs" array.';
-        } // Add more checks if needed (e.g., for disclaimer)
-
-        if (validationError) {
-             console.error(`[AI Validation Error] ${validationError}`, analysisResult);
-             throw new Error(`AI response structure was invalid: ${validationError}`);
+        if (analysisResult.error && analysisResult.error === 'UNREADABLE') {
+            console.log('[AI] AI determined the image is unreadable.');
+            return res.status(400).json({ error: 'Handwriting is unreadable or the image is too blurry. Please upload a clearer image.' });
         }
-        // --- End Validation ---
+
+        if (!analysisResult?.riskLevel || !Array.isArray(analysisResult.extractedDrugs)) {
+            throw new Error('AI response structure was invalid.');
+        }
 
         const newPrescriptionId = `pres_${Date.now()}`;
         const doctorId = 'doc_placeholder_123';
 
-        const prescriptionRequest = new sql.Request(transaction);
-        await prescriptionRequest
-            .input('id', sql.NVarChar, newPrescriptionId)
-            .input('patientId', sql.NVarChar, patientId)
-            .input('doctorId', sql.NVarChar, doctorId)
-            .input('riskLevel', sql.NVarChar, analysisResult.riskLevel)
-            .input('summary', sql.NVarChar, analysisResult.summary || '')
-            .input('recommendations', sql.NVarChar, JSON.stringify(analysisResult.recommendations || []))
-            .query(`INSERT INTO Prescription (id, patientId, doctorId, riskLevel, summary, recommendations, createdAt) VALUES (@id, @patientId, @doctorId, @riskLevel, @summary, @recommendations, SYSUTCDATETIME())`);
+        const prescriptionSql = `
+            INSERT INTO Prescription 
+                (id, patientId, doctorId, riskLevel, summary, recommendations, alternativePrescription, disclaimer, createdAt) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+        `;
+        const prescriptionParams = [
+            newPrescriptionId, 
+            patientId, 
+            doctorId, 
+            analysisResult.riskLevel, 
+            analysisResult.summary || '', 
+            JSON.stringify(analysisResult.recommendations || []),
+            JSON.stringify(analysisResult.alternativePrescription || null),
+            analysisResult.disclaimer || ''
+        ];
+        await connection.query(prescriptionSql, prescriptionParams);
 
         if (analysisResult.extractedDrugs.length > 0) {
-            for (const drug of analysisResult.extractedDrugs) {
-                const drugRequest = new sql.Request(transaction);
-                const newDrugId = `drug_${Date.now()}_${Math.random()}`;
-                await drugRequest
-                    .input('id', sql.NVarChar, newDrugId)
-                    .input('prescriptionId', sql.NVarChar, newPrescriptionId)
-                    .input('name', sql.NVarChar, drug.name || 'Unknown')
-                    .input('dosage', sql.NVarChar, drug.dosage || 'N/A')
-                    .input('frequency', sql.NVarChar, drug.frequency || 'N/A')
-                    .query(`INSERT INTO PrescribedDrug (id, prescriptionId, name, dosage, frequency) VALUES (@id, @prescriptionId, @name, @dosage, @frequency)`);
-            }
+            const drugSql = `INSERT INTO PrescribedDrug (id, prescriptionId, name, dosage, frequency) VALUES ?`;
+            const drugValues = analysisResult.extractedDrugs.map(drug => {
+                 const newDrugId = `drug_${Date.now()}_${Math.random()}`;
+                 return [newDrugId, newPrescriptionId, drug.name || 'Unknown', drug.dosage || 'N/A', drug.frequency || 'N/A'];
+            });
+            await connection.query(drugSql, [drugValues]);
         }
-        await transaction.commit();
+        
+        await connection.commit();
         res.status(201).json({ id: newPrescriptionId, patientId, ...analysisResult });
 
     } catch (error) {
         console.error('Error in prescription upload:', error.message);
-        try { if (transaction && transaction.active) await transaction.rollback(); }
-        catch (rollbackError) { console.error('Failed to rollback transaction:', rollbackError); }
-        // Send back the specific error message
+        if (connection) await connection.rollback(); 
         res.status(500).json({ error: error.message || 'An error occurred during prescription processing.' });
+    } finally {
+        if (connection) connection.release(); 
     }
 });
 
-// GET /api/patients/:id
+app.get('/api/prescriptions/patient/:patientId', async (req, res) => {
+    const { patientId } = req.params;
+    try {
+        const prescriptionsSql = `SELECT * FROM Prescription WHERE patientId = ? ORDER BY createdAt DESC`;
+        const [prescriptions] = await pool.query(prescriptionsSql, [patientId]);
+
+        if (prescriptions.length === 0) {
+            return res.status(200).json([]);
+        }
+
+        const prescriptionHistory = [];
+        for (const pres of prescriptions) {
+            const drugsSql = `SELECT * FROM PrescribedDrug WHERE prescriptionId = ?`;
+            const [drugs] = await pool.query(drugsSql, [pres.id]);
+            
+            prescriptionHistory.push({
+                ...pres,
+                recommendations: JSON.parse(pres.recommendations || '[]'),
+                alternativePrescription: JSON.parse(pres.alternativePrescription || 'null'),
+                extractedDrugs: drugs
+            });
+        }
+        
+        res.status(200).json(prescriptionHistory);
+
+    } catch (err) {
+        console.error('Error fetching prescription history:', err.message);
+        res.status(500).json({ error: 'Failed to retrieve prescription history.' });
+    }
+});
+
+
+app.delete('/api/prescriptions/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const sql = `DELETE FROM Prescription WHERE id = ?`;
+        const [result] = await pool.query(sql, [id]);
+        if (result.affectedRows === 0) return res.status(404).json({ error: 'Prescription not found.' });
+        res.status(200).json({ message: 'Prescription deleted successfully.' });
+    } catch (err) {
+        console.error('Error deleting prescription:', err.message);
+        res.status(500).json({ error: 'Failed to delete prescription.' });
+    }
+});
+
+
 app.get('/api/patients/:id', async (req, res) => {
     const { id } = req.params;
     try {
-        const request = pool.request();
-        const result = await request.input('id', sql.NVarChar, id).query('SELECT * FROM Patient WHERE id = @id');
-        if (result.recordset.length === 0) return res.status(404).json({ error: 'Patient not found.' });
-        res.status(200).json(result.recordset[0]);
+        const [rows] = await pool.query('SELECT * FROM Patient WHERE id = ?', [id]);
+        if (rows.length === 0) return res.status(404).json({ error: 'Patient not found.' });
+        res.status(200).json(rows[0]);
     } catch (err) {
         res.status(500).json({ error: 'Database error.' });
     }
 });
 
-// GET /api/patients
 app.get('/api/patients', async (req, res) => {
     try {
-        const request = pool.request();
-        const result = await request.query('SELECT * FROM Patient ORDER BY createdAt DESC');
-        res.status(200).json(result.recordset);
+        const [rows] = await pool.query('SELECT * FROM Patient ORDER BY createdAt DESC');
+        res.status(200).json(rows);
     } catch (err) {
         res.status(500).json({ error: 'Failed to retrieve patients.' });
     }
 });
 
-// POST /api/patients
 app.post('/api/patients', async (req, res) => {
     const { fullName, dob } = req.body;
     if (!fullName || !dob) return res.status(400).json({ error: 'Required fields missing.' });
     
     const newId = `pat_${Date.now()}`;
+    const sql = `INSERT INTO Patient (id, fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`;
+    const params = [newId, req.body.fullName, req.body.dob, req.body.gender, req.body.bloodType, req.body.contactNumber, req.body.emergencyContact, req.body.allergies, req.body.medicalHistory];
+    
     try {
-        const request = pool.request();
-        await request
-            .input('id', sql.NVarChar, newId)
-            .input('fullName', sql.NVarChar, req.body.fullName)
-            .input('dob', sql.NVarChar, req.body.dob)
-            .input('gender', sql.NVarChar, req.body.gender)
-            .input('bloodType', sql.NVarChar, req.body.bloodType)
-            .input('contactNumber', sql.NVarChar, req.body.contactNumber)
-            .input('emergencyContact', sql.NVarChar, req.body.emergencyContact)
-            .input('allergies', sql.NVarChar, req.body.allergies)
-            .input('medicalHistory', sql.NVarChar, req.body.medicalHistory)
-            .query(`INSERT INTO Patient (id, fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory, createdAt, updatedAt) VALUES (@id, @fullName, @dob, @gender, @bloodType, @contactNumber, @emergencyContact, @allergies, @medicalHistory, SYSUTCDATETIME(), SYSUTCDATETIME())`);
+        await pool.query(sql, params);
         res.status(201).json({ id: newId, ...req.body });
     } catch (err) {
         console.error("DB Error creating patient:", err);
         res.status(500).json({ error: 'Database error.' });
     }
 });
+
+app.delete('/api/patients/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const sql = `DELETE FROM Patient WHERE id = ?`;
+        const [result] = await pool.query(sql, [id]);
+        if (result.affectedRows === 0) return res.status(404).json({ error: 'Patient not found.' });
+        res.status(200).json({ message: 'Patient and all associated records deleted successfully.' });
+    } catch (err) {
+        console.error('Error deleting patient:', err.message);
+        res.status(500).json({ error: 'Failed to delete patient.' });
+    }
+});
+
 
 // --- Start Server ---
 app.listen(PORT, () => {
