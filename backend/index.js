@@ -78,39 +78,12 @@ async function setupDatabase() {
             FOREIGN KEY (prescriptionId) REFERENCES Prescription(id) ON DELETE CASCADE
         );
     `;
-    const createReviewsTable = `
-        CREATE TABLE IF NOT EXISTS Reviews (
-            id VARCHAR(255) PRIMARY KEY,
-            authorName VARCHAR(255) NOT NULL,
-            rating INT NOT NULL,
-            comment TEXT,
-            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    `;
-    
     try {
         console.log('Checking/Creating database tables...');
         await pool.query(createPatientTable);
         await pool.query(createPrescriptionTable);
         await pool.query(createPrescribedDrugTable);
-        await pool.query(createReviewsTable);
         console.log('Database tables are ready.');
-
-        const [rows] = await pool.query('SELECT COUNT(*) as count FROM Reviews');
-        if (rows[0].count === 0) {
-            console.log('No reviews found. Seeding sample reviews...');
-            const sampleReviews = [
-                ['rev_1', 'Dr. Emily Carter', 5, 'This AI tool has significantly reduced our analysis time.'],
-                ['rev_2', 'Dr. Ben Zhao', 4, 'Very impressive transcription accuracy, even on poor handwriting.'],
-                ['rev_3', 'Dr. Aisha Khan', 5, 'The alternative prescription suggestions are a game-changer.'],
-                ['rev_4', 'Nurse Mark David', 4, 'Good, but sometimes flags low-risk items as moderate.'],
-                ['rev_5', 'Dr. Sarah Chen', 5, 'I trust this to double-check all my prescriptions now. Great safety net.'],
-            ];
-            const sql = 'INSERT INTO Reviews (id, authorName, rating, comment) VALUES ?';
-            await pool.query(sql, [sampleReviews]);
-            console.log('Sample reviews seeded.');
-        }
-
     } catch (err) {
         console.error("Fatal Error during database table setup:", err.stack);
         process.exit(1);
@@ -127,129 +100,41 @@ setupDatabase().catch(err => {
 app.use(cors({ origin: process.env.FRONTEND_URL }));
 app.use(express.json());
 
-// --- ⭐️ STEP 1: AI Helper for Llama 3.2 Vision (Transcription) ---
-async function transcribeImageWithLlama(imageBase64, imageMediaType) {
-    const ollamaUrl = `http://10.167.148.78:11434/api/generate`;
-    
-    const prompt = `
-        You are a medical transcriptionist AI. Look at the prescription image.
-        Your goal is to extract the core prescription information.
-        Ignore any large stamps or text that says "Test Prescription" or "Not for Medical Use".
-        Focus ONLY on the patient name, age, and the list of medications with their dosage.
-        
-        Return ONLY the transcribed prescription details.
-        
-        Example of a good response:
-        "Patient: John Doe
-        Age: 65M
-        Rx:
-        Warfarin 5 mg
-        Aspirin 75 mg"
-
-        If the actual prescription handwriting (not the stamps) is unreadable, return the single word: UNREADABLE
-        Do not add any other commentary.
-    `;
-    
-    const requestBody = {
-        model: "llama3.2-vision:latest", 
-        prompt: prompt,
-        images: [imageBase64],
-        stream: false,
-        options: {
-          num_predict: 512,
-          num_ctx: 2048,
-          temperature: 0.4,
-          num_thread: 8
-        }
-    };
-
-    try {
-        console.log('[AI Step 1] Sending image to Llama 3.2 Vision for transcription...');
-        const response = await axios.post(ollamaUrl, requestBody);
-        
-        if (!response.data || !response.data.response) {
-             console.error('[AI Step 1] Llama 3.2 Vision response format unexpected:', JSON.stringify(response.data, null, 2));
-             throw new Error('Llama 3.2 Vision response format was unexpected.');
-        }
-        
-        const transcribedText = response.data.response.trim();
-        console.log('[AI Step 1] Transcription received:', transcribedText);
-        
-        if (transcribedText.toUpperCase().includes('UNREADABLE')) {
-            throw new Error('Handwriting is unreadable or the image is too blurry. Please upload a clearer image.');
-        }
-        
-        return transcribedText;
-
-    } catch (error) {
-        console.error('[AI Step 1] Llama 3.2 Vision API call failed.', error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
-        if (error.code === 'ECONNREFUSED') {
-            throw new Error(`Connection refused. Is your local Ollama server running at ${ollamaUrl}?`);
-        }
-        throw new Error(error.message || 'Failed to transcribe the image with Llama 3.2 Vision.');
+// --- AI Helper Function for Gemini Vision ---
+async function analyzeImageWithGemini(prompt, imageBase64, imageMediaType) {
+    if (!process.env.GOOGLE_GEMINI_API_KEY) {
+        console.error('[AI] Error: GOOGLE_GEMINI_API_KEY environment variable is not set.');
+        throw new Error('AI service configuration error.');
     }
-}
-
-// --- ⭐️ STEP 2: AI Helper for Gemma 2 (Analysis) ---
-async function analyzeTextWithGemma(transcribedText) {
-    const ollamaUrl = `http://10.167.148.78:11434/api/generate`;
-
-    const prompt = `
-        You are a highly accurate medical analysis AI (Gemma 2). Based *only* on the following transcribed text from a prescription, perform these tasks:
-        1. Identify every drug listed.
-        2. Extract its dosage and frequency.
-        3. Analyze the drug combination for interactions.
-        4. Classify the overall risk as "Low", "Moderate", or "High".
-        5. Provide a concise summary of the critical interaction.
-        6. List actionable recommendations for the clinician.
-        7. If risk is 'Moderate' or 'High', suggest a safer alternative prescription.
-        8. Include a fixed disclaimer.
-        
-        Transcribed Text:
-        """
-        ${transcribedText}
-        """
-
-        Return ONLY a single, valid JSON object with this structure:
-        { 
-          "riskLevel": "...", 
-          "summary": "...", 
-          "recommendations": ["...", "..."], 
-          "extractedDrugs": [{ "name": "...", "dosage": "...", "frequency": "..." }], 
-          "alternativePrescription": { "summary": "...", "drugs": [{ "name": "...", "dosage": "...", "frequency": "..." }] },
-          "disclaimer": "This is an AI-generated analysis and has low credibility. It should not be used for final medical decisions without verification by a qualified healthcare professional."
-        }
-    `;
-
+    
+    // Using gemini-2.5-pro model
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${process.env.GOOGLE_GEMINI_API_KEY}`;
+    
     const requestBody = {
-        model: "meditron:7b",
-        prompt: prompt,
-        stream: false,
-        format: "json"
+        contents: [ { parts: [ { text: prompt }, { inline_data: { mime_type: imageMediaType, data: imageBase64 } } ] } ],
+        generationConfig: { responseMimeType: "application/json" }
     };
 
     try {
-        console.log('[AI Step 2] Sending text to Gemma 2 for analysis...');
-        const response = await axios.post(ollamaUrl, requestBody);
-
-        if (!response.data || !response.data.response) {
-             console.error('[AI Step 2] Gemma response format unexpected:', JSON.stringify(response.data, null, 2));
-             throw new Error('Gemma response format was unexpected.');
+        console.log('[AI] Sending image and prompt to Google Gemini 2.5 Pro...');
+        const response = await axios.post(geminiUrl, requestBody);
+        
+        if (!response.data?.candidates?.[0]?.content?.parts?.[0]?.text) {
+             console.error('[AI] Gemini response format unexpected:', JSON.stringify(response.data, null, 2));
+             throw new Error('Gemini response format was unexpected.');
         }
-
-        const resultJsonString = response.data.response;
-        console.log('[AI Step 2] Gemma analysis successful. Raw JSON string:', resultJsonString);
+        
+        const resultJsonString = response.data.candidates[0].content.parts[0].text;
+        console.log('[AI] Gemini analysis successful (JSON parsed).');
         return JSON.parse(resultJsonString);
-
     } catch (error) {
-        console.error('[AI Step 2] Local Gemma API call failed.', error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
-        if (error.code === 'ECONNREFUSED') {
-            throw new Error(`Connection refused. Is your local Ollama server running at ${ollamaUrl}?`);
+        console.error('[AI] Gemini Vision API call or processing failed.', error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
+        if (error.response?.data?.error) {
+             throw new Error(`Gemini API Error: ${error.response.data.error.message}`);
         }
-        throw new Error('Failed to analyze the text with local Gemma.');
+        throw new Error('Failed to analyze the image with Gemini.');
     }
 }
-
 
 // --- API Routes (Updated for 'mysql2' syntax) ---
 app.get('/api/test', (req, res) => {
@@ -290,15 +175,44 @@ app.post('/api/prescriptions/upload/:patientId', upload.single('prescriptionImag
 
         const imageBase64 = req.file.buffer.toString('base64');
         const imageMediaType = req.file.mimetype;
-        
-        const transcribedText = await transcribeImageWithLlama(imageBase64, imageMediaType);
-        console.log('[AI] Transcribed Text:', transcribedText);
-        
-        const analysisResult = await analyzeTextWithGemma(transcribedText);
-        console.log('[AI] Full pipeline successful. Parsed analysis:', analysisResult);
+        const prompt = `
+            You are a highly accurate medical transcription and clinical analysis AI. Analyze the attached prescription image.
+            
+            First, assess the readability of the handwriting.
+            - IF the handwriting is completely unreadable, illegible, or the image is too blurry to analyze,
+              return ONLY the following JSON object:
+              { "error": "UNREADABLE", "message": "The prescription is unreadable." }
+
+            - OTHERWISE, if the image is readable, perform the following tasks:
+            1. Identify every drug listed.
+            2. Extract its dosage and frequency.
+            3. Analyze the drug combination for interactions.
+            4. Classify the overall risk as "Low", "Moderate", or "High".
+            5. Provide a concise summary of the critical interaction.
+            6. List actionable recommendations for the clinician.
+            7. If risk is 'Moderate' or 'High', suggest a safer alternative prescription.
+            8. Include a fixed disclaimer.
+            
+            Return ONLY a single, valid JSON object with this structure:
+            { 
+              "riskLevel": "...", 
+              "summary": "...", 
+              "recommendations": ["...", "..."], 
+              "extractedDrugs": [{ "name": "...", "dosage": "...", "frequency": "..." }], 
+              "alternativePrescription": { "summary": "...", "drugs": [{ "name": "...", "dosage": "...", "frequency": "..." }] },
+              "disclaimer": "This is an AI-generated analysis and has low credibility. It should not be used for final medical decisions without verification by a qualified healthcare professional."
+            }
+        `;
+        const analysisResult = await analyzeImageWithGemini(prompt, imageBase64, imageMediaType);
+        console.log('[AI] Received analysis:', analysisResult);
+
+        if (analysisResult.error && analysisResult.error === 'UNREADABLE') {
+            console.log('[AI] AI determined the image is unreadable.');
+            return res.status(400).json({ error: 'Handwriting is unreadable or the image is too blurry. Please upload a clearer image.' });
+        }
 
         if (!analysisResult?.riskLevel || !Array.isArray(analysisResult.extractedDrugs)) {
-            throw new Error('AI analysis response structure was invalid.');
+            throw new Error('AI response structure was invalid.');
         }
 
         const newPrescriptionId = `pres_${Date.now()}`;
@@ -387,28 +301,6 @@ app.delete('/api/prescriptions/:id', async (req, res) => {
     }
 });
 
-app.get('/api/prescriptions/recent', async (req, res) => {
-    try {
-        const sql = `
-            SELECT 
-                p.id, 
-                p.patientId, 
-                p.riskLevel, 
-                p.createdAt,
-                pt.fullName as patientName 
-            FROM Prescription p
-            JOIN Patient pt ON p.patientId = pt.id
-            ORDER BY p.createdAt DESC
-            LIMIT 5
-        `;
-        const [rows] = await pool.query(sql);
-        res.status(200).json(rows);
-    } catch (err) {
-        console.error('Error fetching recent prescriptions:', err.message);
-        res.status(500).json({ error: 'Failed to retrieve recent prescriptions.' });
-    }
-});
-
 
 app.get('/api/patients/:id', async (req, res) => {
     const { id } = req.params;
@@ -431,16 +323,12 @@ app.get('/api/patients', async (req, res) => {
 });
 
 app.post('/api/patients', async (req, res) => {
-    // --- ⭐️ FIXED: Read from req.body instead of req.params ---
-    const { fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory } = req.body;
-    
-    if (!fullName || !dob) {
-        return res.status(400).json({ error: 'Full Name and Date of Birth are required.' });
-    }
+    const { fullName, dob } = req.body;
+    if (!fullName || !dob) return res.status(400).json({ error: 'Required fields missing.' });
     
     const newId = `pat_${Date.now()}`;
     const sql = `INSERT INTO Patient (id, fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`;
-    const params = [newId, fullName, dob, gender, bloodType, contactNumber, emergencyContact, allergies, medicalHistory];
+    const params = [newId, req.body.fullName, req.body.dob, req.body.gender, req.body.bloodType, req.body.contactNumber, req.body.emergencyContact, req.body.allergies, req.body.medicalHistory];
     
     try {
         await pool.query(sql, params);
@@ -461,30 +349,6 @@ app.delete('/api/patients/:id', async (req, res) => {
     } catch (err) {
         console.error('Error deleting patient:', err.message);
         res.status(500).json({ error: 'Failed to delete patient.' });
-    }
-});
-
-// --- Review Endpoints ---
-app.get('/api/reviews', async (req, res) => {
-    try {
-        const [rows] = await pool.query('SELECT * FROM Reviews ORDER BY createdAt DESC');
-        res.status(200).json(rows);
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to retrieve reviews.' });
-    }
-});
-
-app.post('/api/reviews', async (req, res) => {
-    const { authorName, rating, comment } = req.body;
-    if (!authorName || !rating) return res.status(400).json({ error: 'Author name and rating are required.' });
-    const newId = `rev_${Date.now()}`;
-    const sql = `INSERT INTO Reviews (id, authorName, rating, comment, createdAt) VALUES (?, ?, ?, ?, NOW())`;
-    try {
-        await pool.query(sql, [newId, authorName, rating, comment || '']);
-        // ⭐️ FIXED: Removed the typo "Signature: Vansh"
-        res.status(201).json({ id: newId, ...req.body });
-    } catch (err) {
-        res.status(500).json({ error: 'Database error while creating review.' });
     }
 });
 

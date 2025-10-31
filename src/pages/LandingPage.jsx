@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 
 // Simple medical icon
 const StethoscopeIcon = () => (
-  <svg className="h-16 w-16 text-purple-400" xmlns="/logo.svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
+  <svg className="h-16 w-16 text-purple-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor">
     <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 3v11.25A2.25 2.25 0 0 0 6 16.5h12M3.75 3.75h.008v.008H3.75V3.75Zm.375 0a2.25 2.25 0 0 1 2.25-2.25h15a2.25 2.25 0 0 1 2.25 2.25v15a2.25 2.25 0 0 1-2.25 2.25h-3.375m-12.75 0v-3.375A2.25 2.25 0 0 1 6 13.125h1.5" />
   </svg>
 );
